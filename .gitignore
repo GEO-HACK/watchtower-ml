@@ -1,0 +1,13 @@
+# Data
+data/
+*.csv
+*.zip
+*.parquet
+
+# Environment
+venv/
+.env
+
+# Python
+__pycache__/
+*.pyc
