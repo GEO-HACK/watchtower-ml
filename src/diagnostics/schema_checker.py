@@ -4,6 +4,7 @@ import joblib
 import pickle
 import numpy as np
 import pandas as pd
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
@@ -16,6 +17,25 @@ def find_model_files(models_dir: str) -> List[str]:
     if not os.path.exists(models_dir):
         return []
     return [os.path.join(models_dir, f) for f in os.listdir(models_dir) if f.lower().endswith(('.pkl', '.joblib', '.model'))]
+
+
+def load_feature_names_file() -> Optional[List[str]]:
+    """Look for common feature-names artifacts and load them if present.
+
+    Returns list of feature names or None if not found/failed.
+    """
+    path = os.path.join('src', 'models', 'feature_names.pkl')
+    if not os.path.exists(path):
+        return None
+
+    try:
+        data = joblib.load(path)
+        if isinstance(data, (list, tuple, np.ndarray)):
+            return [str(x) for x in data]
+    except Exception:
+        return None
+
+    return None
 
 
 def load_artifact(path: str) -> Any:
@@ -387,6 +407,10 @@ def validate_inference_df(df: pd.DataFrame, model_info: Dict[str, Any]) -> Tuple
 def align_columns(df: pd.DataFrame, model_info: Dict[str, Any], fill_value=0) -> pd.DataFrame:
     expected = model_info.get('feature_names')
     if expected is None:
+        # Try to load external feature-names artifact as fallback
+        aux = load_feature_names_file()
+        if aux:
+            expected = aux
         # If no expected names, try to match by count
         n = model_info.get('n_features_in_')
         if n is None:
@@ -402,12 +426,46 @@ def align_columns(df: pd.DataFrame, model_info: Dict[str, Any], fill_value=0) ->
         return df.iloc[:, :n]
     # Reorder and add missing columns
     cols = list(map(str, expected))
+
+    # Cleaning helper to normalize whitespace and hidden characters
+    def _clean_name(n: str) -> str:
+        if n is None:
+            return ''
+        s = str(n)
+        s = s.strip()
+        return s
+
+    # Build cleaned maps
+    incoming = [str(c) for c in df.columns]
+    incoming_clean = [_clean_name(c) for c in incoming]
+    expected_clean = [_clean_name(c) for c in cols]
+
+    cleaned_to_originals = {}
+    for orig, clean in zip(incoming, incoming_clean):
+        cleaned_to_originals.setdefault(clean, []).append(orig)
+
     out = pd.DataFrame(index=df.index)
-    for c in cols:
-        if c in df.columns:
-            out[c] = df[c]
+    missing = []
+    for exp, exp_clean in zip(cols, expected_clean):
+        originals = cleaned_to_originals.get(exp_clean)
+        if originals:
+            if len(originals) > 1:
+                # pick first but warn
+                try:
+                    print(f'Warning: multiple incoming columns match expected cleaned name {exp_clean!r}: {originals}. Using {originals[0]}')
+                except Exception:
+                    pass
+            out[exp] = df[originals[0]]
         else:
-            out[c] = fill_value
+            missing.append(exp)
+            out[exp] = fill_value
+
+    if missing:
+        try:
+            print(f'align_columns: missing {len(missing)} expected columns after cleaning: {missing}')
+        except Exception:
+            pass
+
     return out
 
 
