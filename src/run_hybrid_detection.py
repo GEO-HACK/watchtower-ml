@@ -269,7 +269,7 @@ def combine_scores(preds1, preds2, proba1=None, proba2=None, strategy="majority"
 
 def main():
     parser = argparse.ArgumentParser(description='Run hybrid detection on flow features extracted from a PCAP or CSV capture file')
-    parser.add_argument('--capture-file', '--pcap', dest='capture_file', default=os.path.join('src', 'data', 'cicids_sampled_unlabeled_test.csv'), help='Path to input capture file (.pcap or .csv)')
+    parser.add_argument('--capture-file', '--pcap', dest='capture_file', default=os.path.join('src', 'data', 'ddos_unlabeled.csv'), help='Path to input capture file (.pcap or .csv)')
     parser.add_argument('--capture-format', choices=['auto', 'pcap', 'csv'], default='auto', help='Override capture file type detection')
     parser.add_argument('--max-packets', type=int, default=1000, help='Process only this many packets from the PCAP for faster testing (default: 1000)')
     parser.add_argument('--skip-packets', type=int, default=0, help='Skip this many initial packets before processing')
@@ -350,8 +350,8 @@ def main():
     logger.info('Flows generated: %d', len(df))
 
     # By default process the full dataset. Set DEBUG_SAMPLE=True to enable sampling.
-    DEBUG_SAMPLE = False
-    SAMPLE_SIZE = 1000000  # change as needed when DEBUG_SAMPLE=True
+    DEBUG_SAMPLE = True
+    SAMPLE_SIZE = 100000  # change as needed when DEBUG_SAMPLE=True
 
     if DEBUG_SAMPLE:
         if len(df) > SAMPLE_SIZE:
@@ -368,6 +368,8 @@ def main():
     logger.info('Loading models...')
     model1, raw1 = load_maybe_dict_model(model1_path)
     model2, raw2 = load_maybe_dict_model(model2_path)
+    model3_path = os.path.join('src', 'models', 'isolation_forest.pkl')
+    iso_forest = joblib.load(model3_path)
     class_names = get_class_names(model1)
 
     logger.info('Using class labels: %s', ', '.join(class_names))
@@ -378,6 +380,7 @@ def main():
 
     logger.info('Model1 (%s): %s features', os.path.basename(model1_path), model1_info.get('n_features_in_'))
     logger.info('Model2 (%s): %s features', os.path.basename(model2_path), model2_info.get('n_features_in_'))
+    logger.info('Model3 (%s): %s features', os.path.basename(model3_path), getattr(iso_forest, 'n_features_in_', None))
 
     try:
         X = preprocess_for_inference(
@@ -404,6 +407,18 @@ def main():
     logger.info('Running Model2 inference...')
     preds2, proba2 = predict_with_model(model2, X)
 
+    logger.info('Running Model3 (Isolation Forest) inference...')
+    if_preds = iso_forest.predict(X)         # +1 normal, -1 anomaly
+    if_scores = iso_forest.score_samples(X)   # more negative = more anomalous
+
+    # Normalize IF score to [0, 1] attack range for consistent display
+    # score_samples returns negative floats — flip so 1.0 = most anomalous
+    if_score_min = if_scores.min()
+    if_score_max = if_scores.max()
+    if_attack_scores = 1.0 - (
+        (if_scores - if_score_min) / (if_score_max - if_score_min + 1e-9)
+    )
+
     # Apply fusion strategies
     strategies = ["majority", "or", "confidence_weighted", "unanimous_or_majority"]
     fused_results = {}
@@ -416,6 +431,24 @@ def main():
         strategy: combine_scores(preds1, preds2, proba1, proba2, strategy=strategy)
         for strategy in strategies
     }
+
+    # IF escalation — only activates on flows the supervised models cleared
+    final_preds = fused_results['majority'].copy().astype(int)
+    escalated = np.zeros(len(final_preds), dtype=bool)
+
+    for i in range(len(final_preds)):
+        rf_xgb_said_benign = final_preds[i] == 0
+        if_said_anomaly = if_preds[i] == -1
+
+        if rf_xgb_said_benign and if_said_anomaly:
+            final_preds[i] = -1   # -1 = ANOMALY (unknown threat type)
+            escalated[i] = True
+
+    n_escalated = escalated.sum()
+    logger.info(
+        'IF escalation: %d flows escalated from BENIGN to ANOMALY',
+        n_escalated
+    )
 
     decision_threshold = args.decision_threshold
     optimized_threshold = None
@@ -509,6 +542,18 @@ def main():
             else:
                 logger.warning(f"Ground truth has {len(y_test)} samples but generated {len(fused)} flows")
 
+    print("\n" + "-"*80)
+    print("ISOLATION FOREST ESCALATION LAYER")
+    print("-"*80)
+    unique_if, counts_if = np.unique(if_preds, return_counts=True)
+    unique_final, counts_final = np.unique(final_preds, return_counts=True)
+    print(f"\nModel3 ({os.path.basename(model3_path)}):")
+    print(f"  Prediction distribution: {dict(zip(map(int, unique_if), map(int, counts_if)))}")
+    print(f"  Normalized anomaly score range: {if_attack_scores.min():.4f} - {if_attack_scores.max():.4f}")
+    print(f"  Escalated flows: {int(n_escalated)}")
+    print(f"\nFinal output after IF escalation:")
+    print(f"  Prediction distribution: {dict(zip(map(int, unique_final), map(int, counts_final)))}")
+
     # Detailed metrics if ground truth available
     if y_test is not None and len(y_test) >= len(fused):
         print("\n" + "-"*80)
@@ -546,10 +591,13 @@ def main():
         m1_name = class_name_for_prediction(preds1[i], class_names)
         m2_name = class_name_for_prediction(preds2[i], class_names)
         fused_name = class_name_for_prediction(fused_results['majority'][i], class_names)
+        final_name = class_name_for_prediction(final_preds[i], class_names)
         m1_score = float(prediction_confidence(np.asarray([preds1[i]]), proba1[i:i+1] if proba1 is not None else None)[0])
         m2_score = float(prediction_confidence(np.asarray([preds2[i]]), proba2[i:i+1] if proba2 is not None else None)[0])
         fused_score = float(fused_scores['majority'][i])
+        if_score = float(if_attack_scores[i])
         decision = fused_name if fused_name != 'BENIGN' else 'BENIGN'
+        final_decision = final_name if final_name != 'BENIGN' else 'BENIGN'
         if decision_threshold is not None and fused_score < decision_threshold:
             decision = f'BENIGN (low attack score)' if fused_name == 'BENIGN' else f'{fused_name} (below threshold)'
         print(f"\n[Flow {i+1}]")
@@ -557,6 +605,8 @@ def main():
         print(f"  Model1: {int(preds1[i])} ({m1_name}, score={m1_score:.4f})")
         print(f"  Model2: {int(preds2[i])} ({m2_name}, score={m2_score:.4f})")
         print(f"  Fused:  {int(fused_results['majority'][i])} ({fused_name}, attack_score={fused_score:.4f}, threshold={decision_threshold if decision_threshold is not None else 'n/a'}, decision={decision})")
+        print(f"  IF:     {int(if_preds[i])} (anomaly_score={if_score:.4f})")
+        print(f"  Final:  {int(final_preds[i])} ({final_name}, escalated={bool(escalated[i])}, decision={final_decision})")
         if y_test is not None and i < len(y_test):
             print(f"  Ground Truth: {int(y_test[i])} ({class_name_for_prediction(y_test[i], class_names)})")
 
