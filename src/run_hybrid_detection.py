@@ -8,6 +8,7 @@ import pandas as pd
 
 from preprocessing.flow_aggregator import FlowAggregator
 from preprocessing.preprocessing_pipeline1 import preprocess_for_inference
+from utils.latency_tracker import LatencyTracker
 from diagnostics.schema_checker import inspect_model_file
 from sklearn.metrics import classification_report, accuracy_score, f1_score
 
@@ -364,6 +365,8 @@ def main():
         logger.error('No flows extracted from PCAP')
         sys.exit(1)
 
+    latency_tracker = LatencyTracker()
+
     # Load models
     logger.info('Loading models...')
     model1, raw1 = load_maybe_dict_model(model1_path)
@@ -383,6 +386,7 @@ def main():
     logger.info('Model3 (%s): %s features', os.path.basename(model3_path), getattr(iso_forest, 'n_features_in_', None))
 
     try:
+        latency_tracker.start('preprocessing')
         X = preprocess_for_inference(
             df,
             model1_info=model1_info,
@@ -390,6 +394,7 @@ def main():
             pipeline_path=pipeline_path,
             expected_feature_count=70,
         )
+        latency_tracker.stop('preprocessing')
     except RuntimeError as e:
         logger.error('Inference preprocessing failed: %s', e)
         sys.exit(1)
@@ -402,14 +407,20 @@ def main():
 
     # Run inference with both models
     logger.info('Running Model1 inference...')
+    latency_tracker.start('rf_inference')
     preds1, proba1 = predict_with_model(model1, X)
+    latency_tracker.stop('rf_inference')
     
     logger.info('Running Model2 inference...')
+    latency_tracker.start('xgb_inference')
     preds2, proba2 = predict_with_model(model2, X)
+    latency_tracker.stop('xgb_inference')
 
     logger.info('Running Model3 (Isolation Forest) inference...')
+    latency_tracker.start('if_inference')
     if_preds = iso_forest.predict(X)         # +1 normal, -1 anomaly
     if_scores = iso_forest.score_samples(X)   # more negative = more anomalous
+    latency_tracker.stop('if_inference')
 
     # Normalize IF score to [0, 1] attack range for consistent display
     # score_samples returns negative floats — flip so 1.0 = most anomalous
@@ -611,6 +622,25 @@ def main():
             print(f"  Ground Truth: {int(y_test[i])} ({class_name_for_prediction(y_test[i], class_names)})")
 
     print("\n" + "="*80)
+
+    latency_summary = latency_tracker.summary()
+
+    print("\n" + "-"*80)
+    print("LATENCY SUMMARY (ms)")
+    print("-"*80)
+    print(f"  Preprocessing:   {latency_summary['preprocessing']:.4f}")
+    print(f"  RF Inference:    {latency_summary['rf_inference']:.4f}")
+    print(f"  XGB Inference:   {latency_summary['xgb_inference']:.4f}")
+    print(f"  IF Inference:    {latency_summary['if_inference']:.4f}")
+    print(f"  Total:           {latency_summary['total']:.4f}")
+
+    return {
+        'preprocessing_latency_ms': latency_summary['preprocessing'],
+        'rf_inference_latency_ms': latency_summary['rf_inference'],
+        'xgb_inference_latency_ms': latency_summary['xgb_inference'],
+        'if_inference_latency_ms': latency_summary['if_inference'],
+        'total_latency_ms': latency_summary['total'],
+    }
 
 
 if __name__ == '__main__':
