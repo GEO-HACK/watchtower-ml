@@ -285,10 +285,17 @@ def preprocess_for_inference(
     - no row drops
     - hard-fail on schema/preprocessing/output integrity issues
     """
-    if not isinstance(raw_df, pd.DataFrame):
-        raise RuntimeError(f'preprocess_for_inference expects pandas.DataFrame, got {type(raw_df)!r}')
-
-    input_rows, input_cols = raw_df.shape
+    if isinstance(raw_df, pd.DataFrame):
+        input_rows, input_cols = raw_df.shape
+    else:
+        raw_arr = np.asarray(raw_df)
+        if raw_arr.ndim == 1:
+            raw_arr = raw_arr.reshape(1, -1)
+        if raw_arr.ndim != 2:
+            raise RuntimeError(
+                f'preprocess_for_inference expects 2D tabular input, got {type(raw_df)!r} with ndim={raw_arr.ndim}'
+            )
+        input_rows, input_cols = raw_arr.shape
     logger.info('Preprocessing input shape: rows=%d cols=%d', input_rows, input_cols)
 
     resolved_pipeline_path = _resolve_pipeline_path(pipeline_path)
@@ -315,18 +322,25 @@ def preprocess_for_inference(
     _validate_model_feature_schema(model1_info, pipeline_feature_names, 'Model1')
     _validate_model_feature_schema(model2_info, pipeline_feature_names, 'Model2')
 
-    try:
-        working_df = raw_df.rename(columns=PCAP_TO_CICIDS)
-        renamed_count = len(set(raw_df.columns).intersection(set(PCAP_TO_CICIDS.keys())))
-        if renamed_count:
-            logger.info('Renamed %d incoming columns using PCAP_TO_CICIDS mapping', renamed_count)
-    except Exception:
-        working_df = raw_df.copy()
+    if isinstance(raw_df, pd.DataFrame):
+        try:
+            working_df = raw_df.rename(columns=PCAP_TO_CICIDS)
+            renamed_count = len(set(raw_df.columns).intersection(set(PCAP_TO_CICIDS.keys())))
+            if renamed_count:
+                logger.info('Renamed %d incoming columns using PCAP_TO_CICIDS mapping', renamed_count)
+        except Exception:
+            working_df = raw_df.copy()
+    else:
+        working_df = np.asarray(raw_df)
 
     working_df = clean_flow_features(working_df, pipeline_feature_names)
 
     try:
-        transformed = pipeline.transform(working_df)
+        aligned = pipeline.named_steps['feature_aligner'].transform(working_df)
+        imputed = pipeline.named_steps['imputer'].transform(aligned)
+        clipped = pipeline.named_steps['clipper'].transform(imputed)
+        X_input = np.asarray(clipped, dtype=np.float32)
+        transformed = pipeline.named_steps['scaler'].transform(X_input)
     except Exception as exc:
         logger.exception('Preprocessing step failed')
         raise RuntimeError(f'Preprocessing step failed: {exc}') from exc

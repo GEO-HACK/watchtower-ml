@@ -268,6 +268,60 @@ def combine_scores(preds1, preds2, proba1=None, proba2=None, strategy="majority"
     return np.asarray(merged_scores, dtype=float)
 
 
+def prepare_input(raw_input) -> np.ndarray:
+    """
+    Accepts: dict, list, pd.Series, pd.DataFrame, or np.ndarray.
+    Returns: np.float32 numpy array with shape (1, n_features) for single flow,
+             or (n, n_features) for batch.
+    """
+    if isinstance(raw_input, np.ndarray):
+        return raw_input.astype(np.float32)
+    if isinstance(raw_input, pd.DataFrame):
+        # Don't force DataFrame -> numpy here; let the preprocessing pipeline
+        # handle DataFrame extraction and type conversion (it knows which
+        # columns are numeric). Returning the DataFrame preserves string
+        # columns needed by feature alignment.
+        return raw_input
+    if isinstance(raw_input, (dict, pd.Series)):
+        return np.array(list(raw_input.values()), dtype=np.float32).reshape(1, -1)
+    return np.array(raw_input, dtype=np.float32).reshape(1, -1)
+
+
+def warmup_models(rf_model, xgb_model, iso_model, n_features):
+    """Perform a single dummy inference on each model to warm up threads/caches.
+
+    This should be called once at application startup after models are loaded
+    and their runtime parameters have been configured.
+    """
+    try:
+        n = int(n_features) if n_features is not None else 70
+    except Exception:
+        n = 70
+
+    dummy = np.zeros((1, n), dtype=np.float32)
+    try:
+        if rf_model is not None and hasattr(rf_model, 'predict_proba'):
+            rf_model.predict_proba(dummy)
+    except Exception as e:
+        logger.debug('RF warmup failed: %s', e)
+
+    try:
+        if xgb_model is not None and hasattr(xgb_model, 'predict_proba'):
+            xgb_model.predict_proba(dummy)
+    except Exception as e:
+        logger.debug('XGB warmup failed: %s', e)
+
+    try:
+        if iso_model is not None:
+            # decision_function is typically fast and warms native codepaths
+            if hasattr(iso_model, 'decision_function'):
+                iso_model.decision_function(dummy)
+            else:
+                iso_model.predict(dummy)
+    except Exception as e:
+        logger.debug('IF warmup failed: %s', e)
+
+
 def main():
     parser = argparse.ArgumentParser(description='Run hybrid detection on flow features extracted from a PCAP or CSV capture file')
     parser.add_argument('--capture-file', '--pcap', dest='capture_file', default=os.path.join('src', 'data', 'ddos_unlabeled.csv'), help='Path to input capture file (.pcap or .csv)')
@@ -370,9 +424,21 @@ def main():
     # Load models
     logger.info('Loading models...')
     model1, raw1 = load_maybe_dict_model(model1_path)
+    model1.n_jobs = -1
+    model1.verbose = 0
+
     model2, raw2 = load_maybe_dict_model(model2_path)
+    model2.set_params(nthread=-1, predictor='cpu_predictor')
+    try:
+        model2.set_params(predictor='gpu_predictor')
+        logger.info('XGBoost GPU predictor enabled')
+    except Exception as e:
+        logger.info('XGBoost GPU predictor unavailable; using CPU predictor (%s)', e)
+        model2.set_params(predictor='cpu_predictor')
+
     model3_path = os.path.join('src', 'models', 'isolation_forest.pkl')
     iso_forest = joblib.load(model3_path)
+    iso_forest.n_jobs = -1
     class_names = get_class_names(model1)
 
     logger.info('Using class labels: %s', ', '.join(class_names))
@@ -384,11 +450,19 @@ def main():
     logger.info('Model1 (%s): %s features', os.path.basename(model1_path), model1_info.get('n_features_in_'))
     logger.info('Model2 (%s): %s features', os.path.basename(model2_path), model2_info.get('n_features_in_'))
     logger.info('Model3 (%s): %s features', os.path.basename(model3_path), getattr(iso_forest, 'n_features_in_', None))
+    # Warm up loaded models to prime threads and native code paths
+    try:
+        n_features = model1_info.get('n_features_in_') or model2_info.get('n_features_in_') or getattr(iso_forest, 'n_features_in_', None) or 70
+        warmup_models(model1, model2, iso_forest, n_features)
+        logger.info('Model warm-up complete')
+    except Exception as e:
+        logger.warning('Model warm-up failed: %s', e)
 
     try:
+        model_input = prepare_input(df)
         latency_tracker.start('preprocessing')
         X = preprocess_for_inference(
-            df,
+            model_input,
             model1_info=model1_info,
             model2_info=model2_info,
             pipeline_path=pipeline_path,
@@ -408,12 +482,14 @@ def main():
     # Run inference with both models
     logger.info('Running Model1 inference...')
     latency_tracker.start('rf_inference')
-    preds1, proba1 = predict_with_model(model1, X)
+    proba1 = model1.predict_proba(X)
+    preds1 = np.asarray(model1.classes_)[np.argmax(proba1, axis=1)]
     latency_tracker.stop('rf_inference')
     
     logger.info('Running Model2 inference...')
     latency_tracker.start('xgb_inference')
-    preds2, proba2 = predict_with_model(model2, X)
+    proba2 = model2.predict_proba(X)
+    preds2 = np.asarray(model2.classes_)[np.argmax(proba2, axis=1)]
     latency_tracker.stop('xgb_inference')
 
     logger.info('Running Model3 (Isolation Forest) inference...')
