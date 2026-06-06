@@ -40,7 +40,7 @@ async def detect_live(
     """
     # --- Fetch CSV flows from signature module ---
     try:
-        async with httpx.AsyncClient(timeout=300.0) as client:
+        async with httpx.AsyncClient(timeout=3000.0) as client:
             response = await client.get(FLOW_API_URL)
     except httpx.ConnectError:
         raise HTTPException(

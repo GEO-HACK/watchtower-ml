@@ -14,10 +14,28 @@ class DetectRequest(BaseModel):
 
 
 class PredictionResult(BaseModel):
-    label: str = Field(description="Normal or Attack")
-    attack_type: Optional[str] = Field(default=None, description="Attack category if available")
-    confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    # Core
+    label: str                        # 'Normal' | 'Attack'
+    attack_type: Optional[str]        # 'DDoS', 'PortScan', etc. or None
+    confidence: float
 
+    # Per-model
+    model1_label: Optional[str] = None
+    model1_confidence: Optional[float] = None
+    model2_label: Optional[str] = None
+    model2_confidence: Optional[float] = None
+
+    # Isolation Forest
+    if_prediction: Optional[int] = None      # 1 = normal, -1 = anomaly
+    if_anomaly_score: Optional[float] = None
+
+    # Fusion
+    fused_label: Optional[str] = None
+    fused_score: Optional[float] = None
+    escalated: Optional[bool] = None
+
+    # Agreement
+    models_agree: Optional[bool] = None
 
 class DetectionMeta(BaseModel):
     flows_processed: int

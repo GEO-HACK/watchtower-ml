@@ -57,9 +57,12 @@ class MLInferenceService:
     def _label_for_prediction(prediction: int) -> str:
         return "Normal" if int(prediction) == 0 else "Attack"
 
-    def predict_from_dataframe(self, df: pd.DataFrame) -> Tuple[List[Dict[str, Any]], Dict[str, float]]:
+    def predict_from_dataframe(
+        self, df: pd.DataFrame
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, float]]:
         latency_tracker = LatencyTracker()
 
+        # --- Preprocessing ---
         model_input = prepare_input(df)
         latency_tracker.start("preprocessing")
         X = preprocess_for_inference(
@@ -74,16 +77,19 @@ class MLInferenceService:
         if X is None or getattr(X, "size", 0) == 0:
             raise ValueError("No feature data available for inference")
 
+        # --- Random Forest ---
         latency_tracker.start("rf_inference")
         proba1 = self.model1.predict_proba(X)
         preds1 = np.asarray(self.model1.classes_)[np.argmax(proba1, axis=1)]
         latency_tracker.stop("rf_inference")
 
+        # --- XGBoost ---
         latency_tracker.start("xgb_inference")
         proba2 = self.model2.predict_proba(X)
         preds2 = np.asarray(self.model2.classes_)[np.argmax(proba2, axis=1)]
         latency_tracker.stop("xgb_inference")
 
+        # --- Isolation Forest ---
         latency_tracker.start("if_inference")
         if_preds = self.iso_forest.predict(X)
         if_scores = self.iso_forest.score_samples(X)
@@ -91,38 +97,65 @@ class MLInferenceService:
 
         if_score_min = if_scores.min()
         if_score_max = if_scores.max()
-        if_attack_scores = 1.0 - ((if_scores - if_score_min) / (if_score_max - if_score_min + 1e-9))
+        if_attack_scores = 1.0 - (
+            (if_scores - if_score_min) / (if_score_max - if_score_min + 1e-9)
+        )
 
+        # --- Fusion ---
+        strategies = ["majority", "or", "confidence_weighted", "unanimous_or_majority"]
         fused_results = {
             s: combine_predictions(preds1, preds2, proba1, proba2, strategy=s)
-            for s in ["majority", "or", "confidence_weighted", "unanimous_or_majority"]
+            for s in strategies
         }
         fused_scores = {
             s: combine_scores(preds1, preds2, proba1, proba2, strategy=s)
-            for s in ["majority", "or", "confidence_weighted", "unanimous_or_majority"]
+            for s in strategies
         }
 
+        # --- Isolation Forest Escalation ---
         final_preds = fused_results["majority"].copy().astype(int)
         escalated = np.zeros(len(final_preds), dtype=bool)
         for idx in range(len(final_preds)):
-            rf_xgb_said_benign = final_preds[idx] == 0
-            if_said_anomaly = if_preds[idx] == -1
-            if rf_xgb_said_benign and if_said_anomaly:
+            if final_preds[idx] == 0 and if_preds[idx] == -1:
                 final_preds[idx] = -1
                 escalated[idx] = True
 
+        # --- Build Results ---
         results: List[Dict[str, Any]] = []
         for idx, final_pred in enumerate(final_preds):
-            final_name = self._class_name_for_prediction(int(final_pred))
+            final_name  = self._class_name_for_prediction(int(final_pred))
+            rf_name     = self._class_name_for_prediction(int(preds1[idx]))
+            xgb_name    = self._class_name_for_prediction(int(preds2[idx]))
             attack_type = None if int(final_pred) == 0 else final_name
-            confidence = float(if_attack_scores[idx]) if escalated[idx] else float(fused_scores["majority"][idx])
-
-            results.append(
-                {
-                    "label": self._label_for_prediction(int(final_pred)),
-                    "attack_type": attack_type,
-                    "confidence": max(0.0, min(1.0, confidence)),
-                }
+            confidence  = (
+                float(if_attack_scores[idx])
+                if escalated[idx]
+                else float(fused_scores["majority"][idx])
             )
+
+            results.append({
+                # Core output
+                "label":       self._label_for_prediction(int(final_pred)),
+                "attack_type": attack_type,
+                "confidence":  round(max(0.0, min(1.0, confidence)), 4),
+
+                # Per-model predictions
+                "model1_label":      rf_name,
+                "model1_confidence": round(float(np.max(proba1[idx])), 4),
+                "model2_label":      xgb_name,
+                "model2_confidence": round(float(np.max(proba2[idx])), 4),
+
+                # Isolation Forest
+                "if_prediction":    int(if_preds[idx]),
+                "if_anomaly_score": round(float(if_attack_scores[idx]), 4),
+
+                # Fusion
+                "fused_label": final_name,
+                "fused_score": round(float(fused_scores["majority"][idx]), 4),
+                "escalated":   bool(escalated[idx]),
+
+                # Agreement
+                "models_agree": bool(preds1[idx] == preds2[idx]),
+            })
 
         return results, latency_tracker.summary()
