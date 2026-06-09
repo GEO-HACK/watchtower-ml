@@ -15,6 +15,7 @@ class DetectRequest(BaseModel):
 
 class PredictionResult(BaseModel):
     # Core
+    flow_id: Optional[str] = None
     label: str                        # 'Normal' | 'Attack'
     attack_type: Optional[str]        # 'DDoS', 'PortScan', etc. or None
     confidence: float

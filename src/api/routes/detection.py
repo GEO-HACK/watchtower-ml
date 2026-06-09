@@ -3,6 +3,8 @@ from typing import Optional
 import httpx
 import os
 
+from joblib import logger
+
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 
 from api.schemas import DetectResponse, DetectionMeta, HealthResponse, PredictionResult
@@ -15,7 +17,8 @@ from api.services.detection_service import (
 
 router = APIRouter(tags=["detection"])
 
-FLOW_API_URL = os.getenv("FLOW_API_URL", "http://localhost:8001/flows")
+FLOW_API_URL = os.getenv("FLOW_API_URL", "http://localhost:8000/flows")
+SIGNATURE_FUSION_URL = os.getenv("SIGNATURE_FUSION_URL", "http://localhost:8000/flows/ml-results")
 
 
 @router.get("/health", response_model=HealthResponse)
@@ -32,11 +35,8 @@ async def detect_live(
     detection_service: DetectionService = Depends(get_detection_service),
 ) -> DetectResponse:
     """
-    Pulls live flows from signature module (localhost:8001/flows)
+    Pulls live flows from signature module (localhost:8000/flows)
     and runs ML inference on them.
-
-    Test from terminal:
-        curl http://localhost:8002/detect/live | jq
     """
     # --- Fetch CSV flows from signature module ---
     try:
@@ -45,7 +45,7 @@ async def detect_live(
     except httpx.ConnectError:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Cannot reach signature module at {FLOW_API_URL}. Is it running on port 8001?",
+            detail=f"Cannot reach signature module at {FLOW_API_URL}. Is it running on port 8000?",
         )
     except httpx.TimeoutException:
         raise HTTPException(
@@ -89,6 +89,31 @@ async def detect_live(
     single_prediction = PredictionResult(**predictions[0]) if len(predictions) == 1 else None
     batch_predictions = [PredictionResult(**p) for p in predictions] if len(predictions) > 1 else None
 
+    # --- Push to Signature Fusion Layer ---
+    if batch_predictions:
+        predictions_payload = [p.model_dump() if hasattr(p, 'model_dump') else p.dict() for p in batch_predictions]
+    elif single_prediction:
+        predictions_payload = [single_prediction.model_dump() if hasattr(single_prediction, 'model_dump') else single_prediction.dict()]
+    else:
+        predictions_payload = []
+
+    if predictions_payload:
+        try:
+            print(f"ML DEBUG: Pushing {len(predictions_payload)} predictions to {SIGNATURE_FUSION_URL}...")
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.post(SIGNATURE_FUSION_URL, json=predictions_payload, timeout=30.0)
+                print(f"ML DEBUG: Fusion endpoint replied with status: {resp.status_code}")
+                    
+                    # --- NEW: Print the exact reason for the 422 error ---
+                if resp.status_code != 200:
+                    print(f"ML DEBUG ERROR DETAILS: {resp.text}")
+                    # -----------------------------------------------------
+                        
+        except Exception as exc:
+            print(f"ERROR: Failed to stream inference payload to fusion backend: {exc}")
+            print(f"ML DEBUG ERROR: {exc}")
+    # ---------------------------------------
+
     return DetectResponse(
         status="success",
         processing_status="completed",
@@ -111,10 +136,6 @@ async def detect(
 ) -> DetectResponse:
     """
     Run inference on an uploaded CSV file or a path on disk.
-
-    Test from terminal:
-        curl -X POST http://localhost:8002/detect \
-             -F "csv_file=@flows.csv" | jq
     """
     try:
         upload_filename = None
@@ -142,6 +163,25 @@ async def detect(
 
         single_prediction = PredictionResult(**predictions[0]) if len(predictions) == 1 else None
         batch_predictions = [PredictionResult(**p) for p in predictions] if len(predictions) > 1 else None
+
+        # --- Push to Signature Fusion Layer ---
+        if batch_predictions:
+            predictions_payload = [p.model_dump() if hasattr(p, 'model_dump') else p.dict() for p in batch_predictions]
+        elif single_prediction:
+            predictions_payload = [single_prediction.model_dump() if hasattr(single_prediction, 'model_dump') else single_prediction.dict()]
+        else:
+            predictions_payload = []
+
+        if predictions_payload:
+            try:
+                print(f"ML DEBUG: Pushing {len(predictions_payload)} predictions to {SIGNATURE_FUSION_URL}...")
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    resp = await client.post(SIGNATURE_FUSION_URL, json=predictions_payload)
+                    print(f"ML DEBUG: Fusion endpoint replied with status: {resp.status_code}")
+            except Exception as exc:
+                logger.error(f"Failed to stream inference payload to fusion backend: {exc}")
+                print(f"ML DEBUG ERROR: {exc}")
+        # ---------------------------------------
 
         return DetectResponse(
             status="success",

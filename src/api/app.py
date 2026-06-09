@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from api.config import settings
 from api.routes.detection import router as detection_router
+from fastapi.middleware.cors import CORSMiddleware
 
 FLOW_API_URL = os.getenv("FLOW_API_URL", "http://localhost:8001")
 
@@ -35,6 +36,18 @@ app = FastAPI(
     version=settings.api_version,
     description="REST API for Watchtower hybrid ML network traffic detection",
     lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    # Explicitly list your frontend URLs here. Add both localhost and 127.0.0.1 just to be safe!
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 app.include_router(detection_router)

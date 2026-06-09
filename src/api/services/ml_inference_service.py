@@ -57,6 +57,35 @@ class MLInferenceService:
     def _label_for_prediction(prediction: int) -> str:
         return "Normal" if int(prediction) == 0 else "Attack"
 
+    @staticmethod
+    def _first_present_value(row: pd.Series, candidates):
+        for column_name in candidates:
+            if column_name in row.index:
+                value = row.get(column_name)
+                if pd.notna(value) and str(value).strip() != "":
+                    return value
+        return None
+
+    def _row_flow_id(self, row: pd.Series) -> str | None:
+        flow_id = self._first_present_value(row, ["flow_id", "Flow ID"])
+        if flow_id is not None:
+            return str(flow_id)
+
+        src_ip = self._first_present_value(row, ["src_ip", "source_ip", "source", "client_ip", "ip_src"])
+        dst_ip = self._first_present_value(row, ["dst_ip", "destination_ip", "destination", "server_ip", "ip_dst"])
+        src_port = self._first_present_value(row, ["src_port", "source_port", "sport"])
+        dst_port = self._first_present_value(row, ["dst_port", "destination_port", "dport"])
+        protocol = self._first_present_value(row, ["protocol", "proto", "ip_proto"])
+        start_time = self._first_present_value(row, ["start_time", "flow_start", "start", "timestamp", "ts"])
+        end_time = self._first_present_value(row, ["end_time", "flow_end", "end", "stop_time"])
+
+        if all(value is not None for value in (src_ip, dst_ip, src_port, dst_port, protocol)):
+            flow_id = f"{src_ip}:{src_port}->{dst_ip}:{dst_port}/proto={protocol}"
+            if start_time is not None and end_time is not None:
+                flow_id = f"{flow_id}@{start_time}-{end_time}"
+            return flow_id
+        return None
+
     def predict_from_dataframe(
         self, df: pd.DataFrame
     ) -> Tuple[List[Dict[str, Any]], Dict[str, float]]:
@@ -123,6 +152,7 @@ class MLInferenceService:
         # --- Build Results ---
         results: List[Dict[str, Any]] = []
         for idx, final_pred in enumerate(final_preds):
+            row = df.iloc[idx]
             final_name  = self._class_name_for_prediction(int(final_pred))
             rf_name     = self._class_name_for_prediction(int(preds1[idx]))
             xgb_name    = self._class_name_for_prediction(int(preds2[idx]))
@@ -135,6 +165,7 @@ class MLInferenceService:
 
             results.append({
                 # Core output
+                "flow_id": self._row_flow_id(row),
                 "label":       self._label_for_prediction(int(final_pred)),
                 "attack_type": attack_type,
                 "confidence":  round(max(0.0, min(1.0, confidence)), 4),
