@@ -142,7 +142,7 @@ class MLInferenceService:
         }
 
         # --- Isolation Forest Escalation ---
-        final_preds = fused_results["majority"].copy().astype(int)
+        final_preds = fused_results["confidence_weighted"].copy().astype(int)
         escalated = np.zeros(len(final_preds), dtype=bool)
         for idx in range(len(final_preds)):
             if final_preds[idx] == 0 and if_preds[idx] == -1:

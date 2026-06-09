@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 def main():
     parser = argparse.ArgumentParser(description='Run hybrid detection on flow features extracted from a PCAP or CSV capture file')
-    parser.add_argument('--capture-file', '--pcap', dest='capture_file', default=os.path.join('src', 'data', 'ddos_unlabeled.csv'), help='Path to input capture file (.pcap or .csv)')
+    parser.add_argument('--capture-file', '--pcap', dest='capture_file', default=os.path.join('src', 'data', 'watchtower_blind_test_flows.csv'), help='Path to input capture file (.pcap or .csv)')
     parser.add_argument('--capture-format', choices=['auto', 'pcap', 'csv'], default='auto', help='Override capture file type detection')
     parser.add_argument('--max-packets', type=int, default=1000, help='Process only this many packets from the PCAP for faster testing (default: 1000)')
     parser.add_argument('--skip-packets', type=int, default=0, help='Skip this many initial packets before processing')
@@ -182,7 +182,7 @@ def main():
     fused_results = {s: combine_predictions(preds1, preds2, proba1, proba2, strategy=s) for s in strategies}
     fused_scores = {s: combine_scores(preds1, preds2, proba1, proba2, strategy=s) for s in strategies}
 
-    final_preds = fused_results['majority'].copy().astype(int)
+    final_preds = fused_results['confidence_weighted'].copy().astype(int)
     escalated = np.zeros(len(final_preds), dtype=bool)
     for i in range(len(final_preds)):
         rf_xgb_said_benign = final_preds[i] == 0
